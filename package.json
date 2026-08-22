@@ -1,5 +1,5 @@
 {
-  "name": "projection-board-game",
+  "name": "bayes-probability-game",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "vitest run",
+    "test:stress": "vitest run src/bayes/stress.test.ts",
     "test:watch": "vitest",
     "preview": "vite preview"
   },

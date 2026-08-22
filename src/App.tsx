@@ -1,101 +1,216 @@
-import { useEffect, useMemo, useState } from 'react'
-import { CAPTURES_TO_WIN, EVIDENCE_META, INITIAL_CHIPS, MAX_EVIDENCE, MAX_STAKE } from './projection/constants'
-import { applyBotTurn, applyAction, createInitialGame, debugNextPosition, debugSectorPosterior, setMode } from './projection/engine'
-import { normalisedEntropy, positionMarginal, sectorMarginal } from './projection/bayes'
-import { botPersonalityName } from './projection/bot'
-import { isLegalTrapTarget } from './projection/ghost'
-import { ProjectionBoard, tokenForIndex, type BoardInteraction } from './projection/ProjectionBoard'
-import { sectorForCell } from './projection/sectors'
-import type { GameState, Position } from './projection/types'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ProbabilityVisual } from './bayes/Visual'
+import { hashString } from './bayes/random'
+import { createProfile, createSession, probabilityLevel, selectQuestion, skillLabel, strongestMisconception, updateProfile } from './bayes/player'
+import { clearProfile, loadProfile, saveProfile } from './bayes/storage'
+import { SKILLS, type AnswerOption, type MisconceptionKey, type PlayerProfile, type Question, type SessionMode, type SessionState } from './bayes/types'
 import './styles.css'
 
-function coordinate(position: Position): string { return `${String.fromCharCode(65 + position.col)}${position.row + 1}` }
-function percent(value: number): string { return `${Math.round(value * 100)}%` }
-function signed(value: number): string { return `${value >= 0 ? '+' : '−'}${Math.abs(value).toFixed(2)}` }
-function expectedValue(probability: number, stake: number): number { return stake * (3 * probability - 1) }
+const misconceptionCopy: Record<MisconceptionKey, { title: string; body: string }> = {
+  reverseConditional: { title: 'You reversed the conditional.', body: 'P(evidence | hypothesis) is not the same as P(hypothesis | evidence). Read the right side of the bar first.' },
+  baseRateNeglect: { title: 'The base rate still matters.', body: 'Evidence updates the starting probability; it does not erase how rare the hypothesis was.' },
+  denominatorNeglect: { title: 'Check the reference group.', body: 'Your numerator is plausible, but the denominator must contain every case allowed by the condition.' },
+  independenceError: { title: 'Independence needs a reason.', body: 'Do not multiply probabilities unless the events are independent or the conditional probability is known.' },
+  addMultiplyError: { title: 'AND and OR use different moves.', body: 'Independent AND usually multiplies. OR adds, then removes any double-counted overlap.' },
+  complementError: { title: 'You found the other side.', body: 'An event and its complement sum to 100%. Subtract the given probability from the whole.' },
+  payoffBias: { title: 'The jackpot pulled your eye.', body: 'Expected value weights every payoff by how often it happens. A larger prize can still be the worse bet.' },
+}
 
-function Chips({ count }: { count: number }) { return <div className="chip-line" aria-label={`${count} chips`}><span className="chips">{Array.from({ length: INITIAL_CHIPS }, (_, index) => <i key={index} className={index < count ? 'filled' : ''} />)}</span><b>{count}</b></div> }
-function Captures({ count, color = 'player' }: { count: number; color?: 'player' | 'bot' }) { return <span className={`capture-pips ${color}`}>{Array.from({ length: CAPTURES_TO_WIN }, (_, index) => <i key={index} className={index < count ? 'filled' : ''} />)}</span> }
+function todaySeed(): number {
+  return hashString(new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date()))
+}
 
-function Header({ game, onNew, onMode, onDebug, onCoach, onPersonality }: { game: GameState; onNew: () => void; onMode: () => void; onDebug: () => void; onCoach: () => void; onPersonality: () => void }) {
-  return <header className="projection-header">
-    <button className="projection-wordmark" onClick={onNew} aria-label="Start a new projection"><span>◌</span><strong>PROJECTION</strong><small>V1 / HIDDEN MARKOV BOARD</small></button>
-    <div className="match-readout"><span>{game.mode === 'duel' ? 'DUEL / FIRST TO 5' : 'SOLO / UNCERTAINTY IS THE OPPONENT'}</span><strong>CAPTURE {game.player.captures} <small>/ {CAPTURES_TO_WIN}</small></strong></div>
-    <div className="header-tools"><button className="header-toggle" onClick={onMode}><i />{game.mode === 'duel' ? 'SOLO' : 'DUEL'}</button>{game.mode === 'duel' && <button className="header-toggle personality" onClick={onPersonality}><i />{botPersonalityName(game.personality)}</button>}<button className={`header-toggle ${game.coachMode ? 'active' : ''}`} onClick={onCoach}><i />COACH</button><button className={`header-toggle ${game.debug ? 'debug-on' : ''}`} onClick={onDebug}><i />DEBUG</button></div>
+function nextSession(mode: SessionMode): SessionState {
+  const seed = mode === 'daily' ? todaySeed() : (Date.now() ^ Math.floor(Math.random() * 1_000_000)) >>> 0
+  return createSession(mode, seed)
+}
+
+function Header({ profile, session, onMode, onStats }: { profile: PlayerProfile; session: SessionState; onMode: (mode: SessionMode) => void; onStats: () => void }) {
+  const accuracy = profile.questionsAnswered ? Math.round(profile.correct / profile.questionsAnswered * 100) : 0
+  return <header className="bayes-header">
+    <button className="brand" onClick={() => onMode(session.mode)} aria-label="Restart session">
+      <span className="brand-mark"><i /><i /><i /></span>
+      <span><strong>BAYES</strong><small>PROBABILITY, COMPRESSED</small></span>
+    </button>
+    <div className="mode-switch" aria-label="Game mode">
+      <button className={session.mode === 'daily' ? 'active' : ''} onClick={() => onMode('daily')}>Daily 10</button>
+      <button className={session.mode === 'endless' ? 'active' : ''} onClick={() => onMode('endless')}>Endless</button>
+    </div>
+    <button className="level-pill" onClick={onStats} aria-label="Open progress">
+      <span>LEVEL</span><b>{probabilityLevel(profile)}</b><i>{accuracy}%</i>
+    </button>
   </header>
 }
 
-function SignalMap({ scenario }: { scenario: GameState['scenario'] }) {
-  const [selected, setSelected] = useState(0)
-  const row = scenario.likelihoods[selected]
-  return <section className="rail-card signal-map"><span className="rail-eyebrow">SIGNAL MAP / PUBLIC</span><div className="sector-tabs">{scenario.priors.map((prior, index) => <button key={index} className={selected === index ? 'selected' : ''} disabled={prior <= 0} onClick={() => setSelected(index)}>{String.fromCharCode(65 + index)}</button>)}</div><div className="signal-title"><strong>SECTOR {String.fromCharCode(65 + selected)}</strong><small>token likelihoods</small></div><div className="signal-bars">{row.map((probability, index) => <div key={index}><b className={tokenForIndex(index).className}>{tokenForIndex(index).symbol}</b><i><span style={{ width: `${Math.round(probability * 100)}%` }} /></i><small>{percent(probability)}</small></div>)}</div><p>Evidence describes the sector before the Ghost moves.</p></section>
+function Progress({ session, profile }: { session: SessionState; profile: PlayerProfile }) {
+  const progress = session.mode === 'daily' ? session.index / 10 * 100 : (session.index % 20) / 20 * 100
+  return <div className="progress-row">
+    <span>{session.mode === 'daily' ? `QUESTION ${Math.min(session.index + 1, 10)} OF 10` : `QUESTION ${session.index + 1}`}</span>
+    <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
+    <span className="flow"><b>FLOW ×{profile.flow.toFixed(profile.flow % 1 ? 1 : 0)}</b><i>🔥 {profile.streak}</i></span>
+  </div>
 }
 
-function EvidenceRail({ game }: { game: GameState }) {
-  return <section className="rail-card evidence-rail"><span className="rail-eyebrow">EVIDENCE LOG / PRIVATE</span><div className="evidence-list">{game.playerEvidence.length === 0 ? <span className="empty-log">NO TOKENS YET</span> : game.playerEvidence.slice(-MAX_EVIDENCE).map((token) => { const meta = EVIDENCE_META.find((item) => item.id === token.type) ?? EVIDENCE_META[0]; return <div key={token.id}><span className={`evidence-stone ${meta.className}`}>{meta.symbol}</span><b>t−{token.age}</b><small>{meta.name}</small></div> })}</div><p>New evidence arrives before the next Ghost transition. Older clues are still active.</p></section>
+function QuestionVisual({ question }: { question: Question }) {
+  const spec = question.explanation.visual
+  if (spec.type === 'frequency') {
+    const denominator = spec.truePositive + spec.falsePositive
+    return <div className="question-frequency-preview" aria-label="Natural frequency preview">
+      <span>IMAGINE {spec.total.toLocaleString()} CASES</span>
+      <div><i className="true" style={{ width: `${denominator ? spec.truePositive / denominator * 100 : 0}%` }} /><i className="false" /></div>
+      <small><b>{spec.truePositive}</b> true signals <em>+</em> <b>{spec.falsePositive}</b> false signals</small>
+    </div>
+  }
+  if (spec.type === 'bar' && question.kind === 'complement') return <ProbabilityVisual spec={{ ...spec, complementLabel: undefined }} />
+  if (spec.type === 'dots' && question.difficulty <= 2) return <ProbabilityVisual spec={spec} />
+  if (spec.type === 'sequence') return <ProbabilityVisual spec={spec} />
+  if (spec.type === 'table' && ['evidence_strength', 'union_probability'].includes(question.kind)) return <ProbabilityVisual spec={spec} />
+  return null
 }
 
-function PriorRail({ game }: { game: GameState }) {
-  return <section className="rail-card prior-rail"><span className="rail-eyebrow">SECTOR PRIORS / PUBLIC</span><div className="prior-list">{game.scenario.priors.map((prior, index) => <div key={index} className={prior <= 0 ? 'inactive' : ''}><b>{String.fromCharCode(65 + index)}</b><i><span style={{ width: `${Math.round(prior * 100)}%` }} /></i><strong>{percent(prior)}</strong></div>)}</div><p>Base rates are the starting mass. The posterior stays yours to infer.</p></section>
+function HintRail({ hints, count, onHint }: { hints: string[]; count: number; onHint: () => void }) {
+  return <div className="hint-rail">
+    {count > 0 && <div className="hint-card"><span>HINT {count}</span><p>{hints[count - 1]}</p></div>}
+    {count < hints.length && <button onClick={onHint}>✦ {count ? 'Another hint' : 'Need a hint?'}</button>}
+  </div>
 }
 
-function LawRail({ game }: { game: GameState }) {
-  return <section className="rail-card law-rail"><span className="rail-eyebrow">MOVEMENT LAW / PUBLIC</span>{game.scenario.movement === 'still' ? <div className="still-law">GHOST HOLDS POSITION<small>Level 1 isolates the signal.</small></div> : <><div className="law-row"><b>{game.scenario.movement === 'slow' ? '80%' : '60%'}</b><span>continue</span></div><div className="law-row"><b>{game.scenario.movement === 'slow' ? '10%' : '20%'}</b><span>turn left</span></div><div className="law-row"><b>{game.scenario.movement === 'slow' ? '10%' : '20%'}</b><span>turn right</span></div><small>Edges renormalise over legal directions.</small></>}<div className="level-chip">LEVEL {game.level} · {game.scenario.label}</div></section>
+function Answers({ question, selected, locked, onAnswer }: { question: Question; selected?: AnswerOption; locked: boolean; onAnswer: (answer: AnswerOption) => void }) {
+  return <div className="answer-grid" role="group" aria-label="Answer choices">
+    {question.options.map((answer, index) => {
+      const correct = answer.id === question.correctOptionId
+      const state = locked ? correct ? 'correct' : selected?.id === answer.id ? 'wrong' : 'muted' : ''
+      return <button key={answer.id} className={state} disabled={locked} onClick={() => onAnswer(answer)}>
+        <span>{index + 1}</span><b>{answer.label}</b>{locked && correct && <i>✓</i>}{locked && selected?.id === answer.id && !correct && <i>×</i>}
+      </button>
+    })}
+  </div>
 }
 
-function ActionControls({ game, interaction, pendingTrap, stake, onInteraction, onSample, onStake, onPlaceTrap }: { game: GameState; interaction: BoardInteraction; pendingTrap?: Position; stake: 1 | 2 | 3; onInteraction: (next: BoardInteraction) => void; onSample: () => void; onStake: (stake: 1 | 2 | 3) => void; onPlaceTrap: () => void }) {
-  const playerTurn = game.activePlayer === 'player' && !game.gameOver
-  return <section className="action-shell"><div className="action-buttons"><button className={interaction === 'move' ? 'selected' : ''} disabled={!playerTurn} onClick={() => onInteraction(interaction === 'move' ? 'idle' : 'move')}><span>△</span><b>MOVE</b><small>FREE · ONE SQUARE</small></button><button className="sample-button" disabled={!playerTurn || game.player.chips < 1 || game.playerEvidence.length >= MAX_EVIDENCE} onClick={onSample}><span>⊙</span><b>SAMPLE</b><small>−1 CHIP · NO RANGE</small></button><button className={interaction === 'trap' ? 'selected' : ''} disabled={!playerTurn || game.player.chips < 1} onClick={() => onInteraction(interaction === 'trap' ? 'idle' : 'trap')}><span>◇</span><b>TRAP</b><small>RANGE ≤ 2 · PREDICT</small></button></div>{interaction === 'trap' && <div className="trap-console"><span className="trap-instruction">{pendingTrap ? `TARGET ${coordinate(pendingTrap)}` : 'SELECT A SQUARE ON THE BOARD'}</span><div className="stake-picker"><span>STAKE</span>{[1, 2, 3].map((value) => <button key={value} className={stake === value ? 'selected' : ''} disabled={value > Math.min(MAX_STAKE, game.player.chips)} onClick={() => onStake(value as 1 | 2 | 3)}>{'●'.repeat(value)}<small>{value}</small></button>)}<button className="place-trap" disabled={!pendingTrap || stake > game.player.chips} onClick={onPlaceTrap}>PLACE TRAP <span>↗</span></button></div></div>}{interaction === 'move' && <div className="control-hint">Click a highlighted square. Movement changes trap geometry, not the evidence signal.</div>}</section>
+function Feedback({ question, selected, correct, confidence, onConfidence, onNext }: { question: Question; selected: AnswerOption; correct: boolean; confidence?: 'low' | 'medium' | 'high'; onConfidence: (value: 'low' | 'medium' | 'high') => void; onNext: () => void }) {
+  const diagnosis = selected.misconception ? misconceptionCopy[selected.misconception] : undefined
+  return <section className={`feedback ${correct ? 'is-correct' : 'is-wrong'}`} aria-live="polite">
+    <div className="feedback-copy">
+      <span className="result-icon">{correct ? '✓' : '↺'}</span>
+      <div><small>{correct ? 'NICE READ' : 'LET’S TUNE IT'}</small><h2>{correct ? question.explanation.title : diagnosis?.title ?? 'Not quite.'}</h2><p>{correct ? question.explanation.body : diagnosis?.body ?? question.explanation.body}</p></div>
+    </div>
+    <div className="feedback-visual"><ProbabilityVisual spec={question.explanation.visual} /></div>
+    <div className="takeaway"><span>KEEP</span><p>{question.explanation.takeaway}</p></div>
+    <div className="feedback-actions">
+      <div className="confidence"><span>HOW SURE WERE YOU?</span>{(['low', 'medium', 'high'] as const).map((value) => <button className={confidence === value ? 'active' : ''} key={value} onClick={() => onConfidence(value)}>{value}</button>)}</div>
+      <button className="continue" onClick={onNext}>Continue <span>↗</span><kbd>ENTER</kbd></button>
+    </div>
+  </section>
 }
 
-function CoachFeedback({ game, visible }: { game: GameState; visible: boolean }) {
-  const resolution = game.lastResolution
-  if (!resolution || !game.coachMode) return <div className="coach-feedback empty" />
-  const goodDecision = resolution.expectedValue >= 0
-  const sentence = resolution.result === 'hit' ? goodDecision ? 'GOOD PROJECTION · The future square was worth the risk.' : 'GOOD READ, ODD PRICE · A correct result can still be a negative-EV decision.' : goodDecision ? 'GOOD READ, UNLUCKY OUTCOME · The prediction cleared break-even.' : resolution.estimatedHitProbability < 1 / 3 ? 'INSUFFICIENT EVIDENCE · The predictive mass stayed below break-even.' : 'OVERWEIGHTED THE SQUARE · The Ghost did not land where the mass was concentrated.'
-  return <div className={`coach-feedback ${visible ? 'visible' : 'faded'}`}><span>✦</span><b>ENGINE HIT PROBABILITY: {percent(resolution.estimatedHitProbability)}</b><span>·</span><b>STAKE {resolution.stake} EV: {signed(resolution.expectedValue)} CHIPS</b><span>·</span><em>{sentence}</em></div>
+function StatsPanel({ profile, onClose, onReset }: { profile: PlayerProfile; onClose: () => void; onReset: () => void }) {
+  const accuracy = profile.questionsAnswered ? Math.round(profile.correct / profile.questionsAnswered * 100) : 0
+  return <div className="panel-backdrop" onClick={onClose}><aside className="stats-panel" onClick={(event) => event.stopPropagation()}>
+    <div className="panel-head"><span>YOUR MODEL</span><button onClick={onClose}>×</button></div>
+    <div className="big-level"><small>PROBABILITY LEVEL</small><strong>{probabilityLevel(profile)}</strong><span>{profile.xp} XP</span></div>
+    <div className="stat-trio"><div><b>{profile.questionsAnswered}</b><span>answered</span></div><div><b>{accuracy}%</b><span>accuracy</span></div><div><b>{profile.streak}</b><span>streak</span></div></div>
+    <div className="skill-list">{SKILLS.map((skill) => <div key={skill}><span>{skillLabel(skill)}</span><i><em style={{ width: `${profile.skills[skill]}%` }} /></i><b>{Math.round(profile.skills[skill])}</b></div>)}</div>
+    <button className="reset-progress" onClick={onReset}>Reset local progress</button>
+  </aside></div>
 }
 
-function DebugPanel({ game }: { game: GameState }) {
-  const sectorPosterior = debugSectorPosterior(game)
-  const next = debugNextPosition(game)
-  const candidates: Array<{ position: Position; probability: number }> = []
-  for (let row = 0; row < 7; row += 1) for (let col = 0; col < 7; col += 1) if (isLegalTrapTarget(game.player.position, { row, col })) candidates.push({ position: { row, col }, probability: next[row][col] })
-  candidates.sort((a, b) => b.probability - a.probability)
-  return <section className="debug-panel"><div className="debug-head"><span>DEVELOPER LENS / EXACT HIDDEN FILTER</span><b>DEBUG ONLY</b></div><div className="debug-facts"><div><span>TRUE GHOST</span><strong>{coordinate(game.ghost.position)} · {game.ghost.direction}</strong></div><div><span>TRUE SECTOR</span><strong>{String.fromCharCode(65 + sectorForCell(game.ghost.position.row, game.ghost.position.col))}</strong></div><div><span>FILTER MASS</span><strong>{game.playerBelief.flat(2).reduce((sum, value) => sum + value, 0).toFixed(6)}</strong></div><div><span>ENTROPY / SECTOR</span><strong>{normalisedEntropy(sectorPosterior).toFixed(3)} · {sectorPosterior.map(percent).join(' · ')}</strong></div></div><div className="debug-section"><span>SECTOR POSTERIOR</span><div className="debug-bars">{sectorPosterior.map((probability, index) => <div key={index}><b>{String.fromCharCode(65 + index)}</b><i><span style={{ width: `${Math.round(probability * 100)}%` }} /></i><small>{percent(probability)}</small></div>)}</div></div><div className="debug-section"><span>PREDICTIVE POSITION / TOP LEGAL TRAPS</span><div className="debug-targets">{candidates.slice(0, 8).map(({ position, probability }) => <div key={coordinate(position)}><b>{coordinate(position)}</b><span>{percent(probability)}</span><em>{[1, 2, 3].map((stake) => `×${stake} ${signed(expectedValue(probability, stake))}`).join(' · ')}</em></div>)}</div></div><div className="debug-section"><span>LIKELIHOOD MATRIX / ROW SECTOR · COLUMN TOKEN</span><table><thead><tr><th> </th>{EVIDENCE_META.map((item) => <th key={item.id}>{item.symbol}</th>)}</tr></thead><tbody>{game.scenario.likelihoods.map((row, index) => <tr key={index}><th>{String.fromCharCode(65 + index)}</th>{row.map((value, evidence) => <td key={evidence}>{percent(value)}</td>)}</tr>)}</tbody></table></div>{game.mode === 'duel' && <div className="debug-section"><span>BOT SECTOR POSTERIOR / PRIVATE FILTER</span><strong>{sectorMarginal(game.botBelief).map(percent).join(' · ')} · TRUE STATE IS NOT IN BOT CONTEXT</strong></div>}</section>
+function DailyComplete({ session, profile, onReplay, onEndless }: { session: SessionState; profile: PlayerProfile; onReplay: () => void; onEndless: () => void }) {
+  const weak = strongestMisconception(profile)
+  const counts = SKILLS.map((skill) => ({ skill, right: session.answers.filter((answer) => answer.skill === skill && answer.correct).length, total: session.answers.filter((answer) => answer.skill === skill).length })).filter((row) => row.total)
+  return <main className="completion-card">
+    <span className="completion-orbit">◌</span><small>DAILY 10 COMPLETE</small><h1>{session.score} <em>/ 10</em></h1><p>{session.score >= 8 ? 'Your probability instincts are sharpening.' : 'Useful mistakes. Your model just got better.'}</p>
+    <div className="session-skills">{counts.map((row) => <div key={row.skill}><span>{skillLabel(row.skill)}</span><b>{row.right === row.total ? '↑↑' : row.right ? '↑' : '↺'}</b><small>{row.right}/{row.total}</small></div>)}</div>
+    {weak && profile.misconceptions[weak] >= 1 && <div className="weakness"><span>NEXT TARGET</span><b>{misconceptionCopy[weak].title}</b><p>{misconceptionCopy[weak].body}</p></div>}
+    <div className="complete-actions"><button onClick={onEndless}>Keep going <span>→</span></button><button onClick={onReplay}>Replay daily</button></div>
+  </main>
 }
 
-function GameOver({ game, onNew }: { game: GameState; onNew: () => void }) {
-  if (!game.gameOver) return null
-  const win = game.outcome?.winner === 'player'
-  return <section className={`game-over ${win ? 'win' : 'loss'}`}><span>PROJECTION RESOLVED</span><strong>{win ? 'YOU WIN' : 'RUIN — BOT WINS'}</strong><small>{game.outcome?.reason === 'captures' ? 'Five captures. The hidden path was projected.' : 'The chip reserve reached zero.'}</small><button onClick={onNew}>ONE MORE HUNT <span>↗</span></button></section>
+export default function App() {
+  const initialProfile = useMemo(() => loadProfile(), [])
+  const [profile, setProfile] = useState<PlayerProfile>(initialProfile)
+  const [session, setSession] = useState<SessionState>(() => nextSession('daily'))
+  const [question, setQuestion] = useState<Question>(() => selectQuestion(initialProfile, todaySeed(), 0))
+  const [selected, setSelected] = useState<AnswerOption | undefined>(undefined)
+  const [hintCount, setHintCount] = useState(0)
+  const [confidence, setConfidence] = useState<'low' | 'medium' | 'high' | undefined>(undefined)
+  const [statsOpen, setStatsOpen] = useState(false)
+  const startedAt = useRef(performance.now())
+  const selectedRef = useRef<AnswerOption | undefined>(undefined)
+  const profileRef = useRef(profile)
+
+  useEffect(() => { profileRef.current = profile; saveProfile(profile) }, [profile])
+
+  const correct = selected?.id === question.correctOptionId
+
+  const changeMode = useCallback((mode: SessionMode) => {
+    const next = nextSession(mode)
+    setSession(next)
+    setQuestion(selectQuestion(profileRef.current, next.seed, 0))
+    setSelected(undefined); selectedRef.current = undefined; setHintCount(0); setConfidence(undefined); startedAt.current = performance.now()
+  }, [])
+
+  const answer = useCallback((choice: AnswerOption) => {
+    if (selectedRef.current) return
+    selectedRef.current = choice
+    setSelected(choice)
+  }, [])
+
+  const advance = useCallback(() => {
+    const choice = selectedRef.current
+    if (!choice) return
+    const wasCorrect = choice.id === question.correctOptionId
+    const responseMs = Math.max(250, Math.round(performance.now() - startedAt.current))
+    const nextProfile = updateProfile(profileRef.current, question, wasCorrect, responseMs, choice.misconception, hintCount, confidence)
+    profileRef.current = nextProfile
+    setProfile(nextProfile)
+    const answerRecord = { questionId: question.id, correct: wasCorrect, skill: question.skill, misconception: choice.misconception }
+    const nextIndex = session.index + 1
+    const complete = session.mode === 'daily' && nextIndex >= 10
+    const nextState = { ...session, index: nextIndex, score: session.score + (wasCorrect ? 1 : 0), complete, answers: [...session.answers, answerRecord] }
+    setSession(nextState)
+    if (!complete) setQuestion(selectQuestion(nextProfile, session.seed, nextIndex))
+    setSelected(undefined); selectedRef.current = undefined; setHintCount(0); setConfidence(undefined); startedAt.current = performance.now()
+  }, [confidence, hintCount, question, session])
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (statsOpen) return
+      if (!selectedRef.current && ['1', '2', '3', '4'].includes(event.key)) {
+        const choice = question.options[Number(event.key) - 1]
+        if (choice) answer(choice)
+      } else if (selectedRef.current && event.key === 'Enter') advance()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [advance, answer, question, statsOpen])
+
+  const reset = () => {
+    clearProfile(); const fresh = createProfile(); profileRef.current = fresh; setProfile(fresh); setStatsOpen(false)
+    const next = nextSession('daily'); setSession(next); setQuestion(selectQuestion(fresh, next.seed, 0)); setSelected(undefined); selectedRef.current = undefined
+  }
+
+  const progressStyle = useMemo(() => ({ '--skill-color': question.skill === 'bayes' ? '#ff8b5c' : '#77dfc4' } as React.CSSProperties), [question.skill])
+
+  return <div className="bayes-app" style={progressStyle}>
+    <div className="ambient ambient-one" /><div className="ambient ambient-two" />
+    <Header profile={profile} session={session} onMode={changeMode} onStats={() => setStatsOpen(true)} />
+    <Progress session={session} profile={profile} />
+    {session.complete ? <DailyComplete session={session} profile={profile} onReplay={() => changeMode('daily')} onEndless={() => changeMode('endless')} /> : <main className={`game-shell ${selected ? 'answered' : ''}`}>
+      <section className="question-card">
+        <div className="question-meta"><span>{question.eyebrow}</span><b>{skillLabel(question.skill)}</b><i>LV {question.difficulty}</i></div>
+        <div className="question-body">
+          {question.notation && <div className="notation">{question.notation}</div>}
+          <h1>{question.prompt}</h1>
+          {question.detail && <p>{question.detail}</p>}
+          <QuestionVisual question={question} />
+        </div>
+        <Answers question={question} selected={selected} locked={Boolean(selected)} onAnswer={answer} />
+        {!selected && <HintRail hints={question.hints} count={hintCount} onHint={() => setHintCount((count) => Math.min(question.hints.length, count + 1))} />}
+        {!selected && <div className="keyboard-hint"><span>KEYS</span> 1–4 to answer</div>}
+      </section>
+      {selected && <Feedback question={question} selected={selected} correct={Boolean(correct)} confidence={confidence} onConfidence={setConfidence} onNext={advance} />}
+    </main>}
+    <footer><span>LEARN THE SHAPE, NOT THE SCRIPT.</span><i>●</i><span>LOCAL PROGRESS · NO HEARTS · NO TIMER</span></footer>
+    {statsOpen && <StatsPanel profile={profile} onClose={() => setStatsOpen(false)} onReset={reset} />}
+  </div>
 }
-
-function App() {
-  const [game, setGame] = useState<GameState>(() => createInitialGame())
-  const [interaction, setInteraction] = useState<BoardInteraction>('idle')
-  const [pendingTrap, setPendingTrap] = useState<Position | undefined>()
-  const [stake, setStake] = useState<1 | 2 | 3>(1)
-  const [coachVisible, setCoachVisible] = useState(false)
-
-  const playerTurn = game.activePlayer === 'player' && !game.gameOver
-  useEffect(() => { if (game.mode !== 'duel' || game.activePlayer !== 'bot' || game.gameOver) return undefined; const timer = window.setTimeout(() => setGame((current) => applyBotTurn(current)), 620); return () => window.clearTimeout(timer) }, [game.mode, game.activePlayer, game.turn, game.gameOver])
-  useEffect(() => { if (!game.lastResolution) return undefined; setCoachVisible(true); const timer = window.setTimeout(() => setCoachVisible(false), 3600); return () => window.clearTimeout(timer) }, [game.lastResolution])
-
-  const nextPosition = useMemo(() => game.debug ? debugNextPosition(game) : undefined, [game, game.debug])
-  const lastEvent = game.publicEvents[game.publicEvents.length - 1]
-  const turnMessage = game.gameOver ? 'HUNT COMPLETE' : game.activePlayer === 'bot' ? 'BOT TURN · READING THE FIELD' : interaction === 'trap' ? 'PREDICT THE NEXT SQUARE' : interaction === 'move' ? 'POSITION FOR THE TRAP' : 'YOUR TURN · BUILD THE PROJECTION'
-
-  const resetInteraction = () => { setInteraction('idle'); setPendingTrap(undefined); setStake(1) }
-  const dispatch = (action: Parameters<typeof applyAction>[1]) => { if (!playerTurn) return; setGame((current) => applyAction(current, action)); resetInteraction() }
-  const onCellClick = (position: Position) => { if (!playerTurn) return; if (interaction === 'move') dispatch({ type: 'move', to: position }); else if (interaction === 'trap' && isLegalTrapTarget(game.player.position, position)) setPendingTrap(position) }
-  const onInteraction = (next: BoardInteraction) => { if (!playerTurn) return; if (next === 'idle') resetInteraction(); else if (next === 'move') { setInteraction('move'); setPendingTrap(undefined) } else { setInteraction('trap'); setPendingTrap(undefined) } }
-  const onSample = () => dispatch({ type: 'sample' })
-  const onPlaceTrap = () => { if (pendingTrap) dispatch({ type: 'trap', target: pendingTrap, stake }) }
-  const newGame = (mode: GameState['mode'] = game.mode) => { setGame(setMode(mode)); resetInteraction(); setCoachVisible(false) }
-  const cyclePersonality = () => setGame((current) => ({ ...current, personality: current.personality === 'conservative' ? 'balanced' : current.personality === 'balanced' ? 'aggressive' : 'conservative' }))
-
-  return <div className="projection-app"><Header game={game} onNew={() => newGame()} onMode={() => newGame(game.mode === 'solo' ? 'duel' : 'solo')} onDebug={() => setGame((current) => ({ ...current, debug: !current.debug }))} onCoach={() => setGame((current) => ({ ...current, coachMode: !current.coachMode }))} onPersonality={cyclePersonality} /><main className="projection-main"><section className="match-strip"><div className="player-readout"><span>YOU</span><strong><Chips count={game.player.chips} /></strong><small>CAPTURES <Captures count={game.player.captures} /></small></div><div className="turn-console"><span>PROJECTION / FIELD SIGNAL</span><strong>{turnMessage}</strong><small>TURN {String(game.turn).padStart(2, '0')} · {lastEvent ? `${lastEvent.actor === 'player' ? 'YOU' : 'BOT'} ${lastEvent.action.toUpperCase()}${lastEvent.result ? ` · ${lastEvent.result.toUpperCase()}` : ''}` : 'NO PUBLIC ACTIONS YET'}</small></div>{game.mode === 'duel' ? <div className="player-readout bot-readout"><span>BOT · {botPersonalityName(game.personality)}</span><strong><Chips count={game.bot.chips} /></strong><small>CAPTURES <Captures count={game.bot.captures} color="bot" /></small></div> : <div className="solo-note"><span>SOLO FIELD</span><strong>UNCERTAINTY</strong><small>BOT AVAILABLE IN DUEL</small></div>}</section><section className="play-layout"><div className="board-column"><ProjectionBoard game={game} interaction={interaction} pendingTrap={pendingTrap} nextPosition={nextPosition} onCellClick={onCellClick} /><CoachFeedback game={game} visible={coachVisible} /><ActionControls game={game} interaction={interaction} pendingTrap={pendingTrap} stake={stake} onInteraction={onInteraction} onSample={onSample} onStake={setStake} onPlaceTrap={onPlaceTrap} /></div><aside className="side-rail"><PriorRail game={game} /><EvidenceRail game={game} /><SignalMap scenario={game.scenario} /><LawRail game={game} /></aside></section><div className="bottom-status"><span><i />LOCAL / NO NETWORK</span><span>ONE BOARD · THREE ACTIONS</span><span>LEVEL {game.level} · {game.player.chips} CHIPS · MOVE RATE IS A DESIGN VARIABLE</span></div>{game.debug && <DebugPanel game={game} />}<GameOver game={game} onNew={() => newGame()} /></main><footer className="projection-footer"><span>PROJECTION V1</span><span>GOOD PROJECTION ≠ GUARANTEED CAPTURE</span><span>5 CAPTURES TO WIN</span></footer></div>
-}
-
-export default App
